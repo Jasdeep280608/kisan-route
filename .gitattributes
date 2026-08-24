@@ -1,0 +1,1057 @@
+import React, { useState, useEffect, useRef } from "react";
+
+/**
+ * KISAN ROUTE — working simulated demo
+ * -------------------------------------
+ * This is a self-contained, fully working demo of the app described in
+ * the brief: Provider (farmer), Customer (buyer), and Driver accounts
+ * that interact through a shared marketplace, using the SAME data flow
+ * as the real backend code (see the delivered project for the real,
+ * deployable version).
+ *
+ * Since this runs inside a chat artifact rather than a real phone/server:
+ *  - OTP is shown directly on screen instead of being texted (no real SMS gateway here)
+ *  - UPI payment is simulated as instantly successful (no real bank connection here)
+ *  - Driver GPS is simulated by animating a marker from pickup to drop
+ * Everything else — accounts, listings, auto price-matching, partial
+ * purchases, inventory updates, shipment creation & payout math — is
+ * real logic, not just a mockup.
+ *
+ * Data is stored with window.storage (shared = true) so if you open this
+ * artifact in two browser tabs, actions in one (e.g. a farmer listing a
+ * crop) show up in the other (e.g. a customer buying it).
+ */
+
+// ---------------------------------------------------------------------
+// STATIC DATA (mirrors backend/src/utils/seedData.js)
+// ---------------------------------------------------------------------
+const CATALOG = {
+  crop: [
+    { name: "Wheat", icon: "🌾", price: 2275, unit: "quintal" },
+    { name: "Rice (Paddy)", icon: "🌾", price: 2183, unit: "quintal" },
+    { name: "Maize", icon: "🌽", price: 2090, unit: "quintal" },
+    { name: "Onion", icon: "🧅", price: 1800, unit: "quintal" },
+    { name: "Potato", icon: "🥔", price: 1200, unit: "quintal" },
+    { name: "Tomato", icon: "🍅", price: 1500, unit: "quintal" },
+    { name: "Turmeric", icon: "🟡", price: 14500, unit: "quintal" },
+    { name: "Cotton", icon: "☁️", price: 7121, unit: "quintal" },
+  ],
+  fabric: [
+    { name: "Cotton Fiber", icon: "🧵", price: 62, unit: "kg" },
+    { name: "Jute", icon: "🧵", price: 48, unit: "kg" },
+    { name: "Silk Cocoon", icon: "🧵", price: 450, unit: "kg" },
+    { name: "Wool", icon: "🧵", price: 210, unit: "kg" },
+  ],
+  seed: [
+    { name: "Wheat Seed", icon: "🌱", price: 32, unit: "kg" },
+    { name: "Rice Seed", icon: "🌱", price: 45, unit: "kg" },
+    { name: "Cotton Seed", icon: "🌱", price: 550, unit: "kg" },
+    { name: "Sunflower Seed", icon: "🌱", price: 120, unit: "kg" },
+  ],
+  wood: [
+    { name: "Teak Wood", icon: "🪵", price: 65000, unit: "ton" },
+    { name: "Eucalyptus", icon: "🪵", price: 6200, unit: "ton" },
+    { name: "Bamboo", icon: "🎍", price: 5500, unit: "ton" },
+  ],
+  waste: [
+    { name: "Dry Hay", icon: "🌾", price: 5, unit: "kg" },
+    { name: "Straw", icon: "🌾", price: 5, unit: "kg" },
+    { name: "Husk", icon: "🌾", price: 5, unit: "kg" },
+  ],
+};
+
+const TYPE_META = {
+  crop: { label: "Crop", icon: "🌾" },
+  fabric: { label: "Fabric", icon: "🧵" },
+  seed: { label: "Seed", icon: "🌱" },
+  wood: { label: "Wood", icon: "🪵" },
+  waste: { label: "Waste (fodder/hay)", icon: "🌿" },
+};
+
+const LANGUAGES = [
+  { code: "hi", label: "हिन्दी", en: "Hindi" },
+  { code: "en", label: "English", en: "English" },
+  { code: "mr", label: "मराठी", en: "Marathi" },
+  { code: "pa", label: "ਪੰਜਾਬੀ", en: "Punjabi" },
+  { code: "gu", label: "ગુજરાતી", en: "Gujarati" },
+  { code: "ta", label: "தமிழ்", en: "Tamil" },
+  { code: "te", label: "తెలుగు", en: "Telugu" },
+  { code: "bn", label: "বাংলা", en: "Bengali" },
+];
+
+// ---------------------------------------------------------------------
+// STORAGE HELPERS (wraps window.storage with JSON + graceful fallback)
+// ---------------------------------------------------------------------
+async function loadList(key) {
+  try {
+    const res = await window.storage.get(key, true);
+    return res ? JSON.parse(res.value) : [];
+  } catch {
+    return [];
+  }
+}
+async function saveList(key, value) {
+  try {
+    await window.storage.set(key, JSON.stringify(value), true);
+  } catch (e) {
+    console.error("storage save failed", e);
+  }
+}
+
+function uid() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function haversine(a, b) {
+  const toRad = (d) => (d * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const x =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+}
+function driverPay(distanceKm, minutes) {
+  return Math.round(60 + distanceKm * 12 + minutes * 1.5);
+}
+
+// Random-ish demo coordinates around Delhi NCR so distances look real
+function randomPoint() {
+  return { lat: 28.6 + (Math.random() - 0.5) * 0.6, lng: 77.2 + (Math.random() - 0.5) * 0.6 };
+}
+
+// ---------------------------------------------------------------------
+// THEME (inline styles, matches the delivered app's green/yellow/leaf look)
+// ---------------------------------------------------------------------
+const C = {
+  forest: "#1B5E20",
+  leaf: "#2E7D32",
+  paleGreen: "#E8F5E9",
+  yellow: "#F9A825",
+  softYellow: "#FFF3C4",
+  cream: "#FFFDF5",
+  textDark: "#1B2E1D",
+  textMuted: "#5C6B5D",
+  danger: "#C62828",
+};
+
+function Btn({ children, onClick, variant = "primary", disabled, style }) {
+  const base = {
+    width: "100%",
+    padding: "14px 18px",
+    borderRadius: 14,
+    border: "none",
+    fontWeight: 700,
+    fontSize: 15,
+    cursor: disabled ? "not-allowed" : "pointer",
+    opacity: disabled ? 0.5 : 1,
+    transition: "transform .1s",
+  };
+  const variants = {
+    primary: { background: C.leaf, color: "white", boxShadow: "0 4px 14px rgba(27,94,32,.25)" },
+    accent: { background: C.yellow, color: C.textDark, boxShadow: "0 4px 14px rgba(249,168,37,.3)" },
+    outline: { background: "transparent", color: C.leaf, border: `2px solid ${C.leaf}` },
+  };
+  return (
+    <button
+      disabled={disabled}
+      onClick={onClick}
+      style={{ ...base, ...variants[variant], ...style }}
+      onMouseDown={(e) => (e.currentTarget.style.transform = "scale(0.98)")}
+      onMouseUp={(e) => (e.currentTarget.style.transform = "scale(1)")}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Card({ children, style }) {
+  return (
+    <div
+      style={{
+        background: "white",
+        borderRadius: 16,
+        padding: 16,
+        boxShadow: "0 4px 16px rgba(27,94,32,.10)",
+        marginBottom: 12,
+        ...style,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Leaf({ size = 24, color = "white" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <path d="M12 2C7 2 3 6 3 11c0 6 5 11 9 11s9-5 9-11c0-5-4-9-9-9z" fill={color} opacity="0.9" />
+    </svg>
+  );
+}
+
+function Header({ title, subtitle, onBack }) {
+  return (
+    <div
+      style={{
+        background: C.forest,
+        color: "white",
+        padding: "22px 20px",
+        borderRadius: "0 0 24px 24px",
+        position: "relative",
+        overflow: "hidden",
+      }}
+    >
+      <div style={{ position: "absolute", top: -10, right: -10, opacity: 0.15 }}>
+        <Leaf size={90} />
+      </div>
+      {onBack && (
+        <span style={{ cursor: "pointer", fontSize: 20 }} onClick={onBack}>
+          ←{" "}
+        </span>
+      )}
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <Leaf size={22} />
+        <h2 style={{ margin: 0, fontSize: 20 }}>{title}</h2>
+      </div>
+      {subtitle && <p style={{ margin: "4px 0 0", fontSize: 13, color: "#C8E6C9" }}>{subtitle}</p>}
+    </div>
+  );
+}
+
+function StatusPill({ status }) {
+  const map = {
+    placed: ["#FFF3C4", "#8A6D00"],
+    paid: ["#E3F2FD", "#1565C0"],
+    shipment_assigned: ["#E3F2FD", "#1565C0"],
+    accepted: ["#E3F2FD", "#1565C0"],
+    picked_up: ["#FFE0B2", "#E65100"],
+    in_transit: ["#FFE0B2", "#E65100"],
+    delivered: ["#E8F5E9", "#1B5E20"],
+    available: ["#FFF3C4", "#8A6D00"],
+  };
+  const [bg, fg] = map[status] || ["#eee", "#333"];
+  return (
+    <span style={{ background: bg, color: fg, fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 20 }}>
+      {status.replace("_", " ")}
+    </span>
+  );
+}
+
+function BottomNav({ items, active, onChange }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-around", background: "white", borderTop: `1px solid ${C.paleGreen}`, padding: "8px 0" }}>
+      {items.map((it) => (
+        <div
+          key={it.key}
+          onClick={() => onChange(it.key)}
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: 2,
+            fontSize: 10,
+            fontWeight: active === it.key ? 700 : 400,
+            color: active === it.key ? C.leaf : C.textMuted,
+            cursor: "pointer",
+            padding: "2px 10px",
+          }}
+        >
+          <span style={{ fontSize: 20 }}>{it.icon}</span>
+          {it.label}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const Input = (props) => (
+  <input
+    {...props}
+    style={{
+      width: "100%",
+      padding: "13px 14px",
+      borderRadius: 10,
+      border: `2px solid ${C.paleGreen}`,
+      fontSize: 15,
+      boxSizing: "border-box",
+      ...(props.style || {}),
+    }}
+  />
+);
+
+// ---------------------------------------------------------------------
+// MAIN APP
+// ---------------------------------------------------------------------
+export default function KisanRouteDemo() {
+  const [screen, setScreen] = useState("splash"); // splash -> role -> login -> home
+  const [language, setLanguage] = useState(null);
+  const [role, setRole] = useState(null);
+  const [user, setUser] = useState(null);
+
+  const [listings, setListings] = useState([]);
+  const [orders, setOrders] = useState([]);
+  const [shipments, setShipments] = useState([]);
+  const [loadingData, setLoadingData] = useState(true);
+
+  // poll shared storage every 2s so multi-tab / multi-role demo stays in sync
+  useEffect(() => {
+    let mounted = true;
+    async function refresh() {
+      const [l, o, s] = await Promise.all([loadList("listings"), loadList("orders"), loadList("shipments")]);
+      if (mounted) {
+        setListings(l);
+        setOrders(o);
+        setShipments(s);
+        setLoadingData(false);
+      }
+    }
+    refresh();
+    const iv = setInterval(refresh, 2000);
+    return () => {
+      mounted = false;
+      clearInterval(iv);
+    };
+  }, []);
+
+  function goHome(r) {
+    setRole(r);
+    setScreen("home");
+  }
+
+  if (screen === "splash") return <SplashScreen onNext={(lang) => { setLanguage(lang); setScreen("role"); }} />;
+  if (screen === "role") return <RoleScreen onSelect={(r) => { setRole(r); setScreen("login"); }} onBack={() => setScreen("splash")} />;
+  if (screen === "login")
+    return (
+      <LoginScreen
+        role={role}
+        language={language}
+        onLogin={(u) => { setUser(u); goHome(role); }}
+        onBack={() => setScreen("role")}
+      />
+    );
+
+  if (loadingData) return <Shell><div style={{ padding: 40, textAlign: "center" }}>Loading Kisan Route...</div></Shell>;
+
+  const ctx = { user, listings, orders, shipments, setListings, setOrders, setShipments, logout: () => { setUser(null); setScreen("splash"); } };
+
+  if (role === "provider") return <ProviderApp {...ctx} />;
+  if (role === "customer") return <CustomerApp {...ctx} />;
+  if (role === "driver") return <DriverApp {...ctx} />;
+  return null;
+}
+
+function Shell({ children }) {
+  return (
+    <div style={{ maxWidth: 420, margin: "0 auto", minHeight: 640, background: C.cream, display: "flex", flexDirection: "column", fontFamily: "'Segoe UI', system-ui, sans-serif", borderRadius: 20, overflow: "hidden", boxShadow: "0 8px 30px rgba(0,0,0,0.12)" }}>
+      {children}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// SPLASH — language select ("Bhasha")
+// ---------------------------------------------------------------------
+function SplashScreen({ onNext }) {
+  return (
+    <Shell>
+      <div style={{ background: C.forest, padding: "40px 20px 26px", textAlign: "center", position: "relative", overflow: "hidden" }}>
+        <div style={{ display: "flex", justifyContent: "center", gap: 10, marginBottom: 6 }}>
+          <Leaf /> <Leaf size={34} /> <Leaf />
+        </div>
+        <h1 style={{ color: "white", fontSize: 30, margin: "6px 0 4px" }}>Kisan Route</h1>
+        <p style={{ color: "#E8F5E9", fontSize: 13, margin: 0 }}>किसान से सीधे ग्राहक तक • Straight from farmer to buyer</p>
+      </div>
+      <div style={{ padding: 20, flex: 1, overflowY: "auto" }}>
+        <h3 style={{ textAlign: "center", color: C.forest }}>भाषा चुनें · Bhasha</h3>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {LANGUAGES.map((l) => (
+            <button
+              key={l.code}
+              onClick={() => onNext(l.code)}
+              style={{ display: "flex", justifyContent: "space-between", padding: "16px 18px", borderRadius: 14, border: `2px solid ${C.leaf}`, background: "transparent", color: C.leaf, cursor: "pointer" }}
+            >
+              <span style={{ fontWeight: 700, fontSize: 17 }}>{l.label}</span>
+              <span style={{ fontSize: 12, color: C.textMuted }}>{l.en}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </Shell>
+  );
+}
+
+// ---------------------------------------------------------------------
+// ROLE SELECT
+// ---------------------------------------------------------------------
+function RoleScreen({ onSelect, onBack }) {
+  const roles = [
+    { key: "provider", icon: "🌾", label: "Farmer (Provider)", desc: "Sell your crops directly, no middleman" },
+    { key: "customer", icon: "🛒", label: "Customer (Buyer)", desc: "Buy fresh crops straight from farmers" },
+    { key: "driver", icon: "🚚", label: "Truck Driver", desc: "Earn by delivering shipments" },
+  ];
+  return (
+    <Shell>
+      <Header title="Select Account Type" onBack={onBack} />
+      <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 14, flex: 1 }}>
+        {roles.map((r) => (
+          <Card key={r.key} style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 14 }}>
+            <div onClick={() => onSelect(r.key)} style={{ display: "flex", alignItems: "center", gap: 14, width: "100%" }}>
+              <div style={{ fontSize: 36 }}>{r.icon}</div>
+              <div>
+                <div style={{ fontWeight: 700, color: C.forest }}>{r.label}</div>
+                <div style={{ fontSize: 12, color: C.textMuted }}>{r.desc}</div>
+              </div>
+            </div>
+          </Card>
+        ))}
+      </div>
+    </Shell>
+  );
+}
+
+// ---------------------------------------------------------------------
+// LOGIN — mobile + OTP (+ UPI for provider/driver)
+// ---------------------------------------------------------------------
+function LoginScreen({ role, onLogin, onBack }) {
+  const [step, setStep] = useState("mobile");
+  const [mobile, setMobile] = useState("");
+  const [demoOtp, setDemoOtp] = useState("");
+  const [otp, setOtp] = useState("");
+  const [name, setName] = useState("");
+  const [upi, setUpi] = useState("");
+  const [error, setError] = useState("");
+
+  function sendOtp() {
+    if (!/^[6-9]\d{9}$/.test(mobile)) return setError("Enter a valid 10-digit mobile number");
+    setError("");
+    const code = String(Math.floor(1000 + Math.random() * 9000));
+    setDemoOtp(code);
+    setStep("otp");
+  }
+
+  function verify() {
+    if (otp !== demoOtp) return setError("Incorrect OTP");
+    if (!name) return setError("Please enter your name");
+    if (role !== "customer" && !upi) return setError("UPI ID is required for this account type");
+    setError("");
+    onLogin({ id: uid(), mobile, name, upi, role });
+  }
+
+  return (
+    <Shell>
+      <Header title={`${role[0].toUpperCase()}${role.slice(1)} Login`} onBack={onBack} />
+      <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 14, flex: 1 }}>
+        {step === "mobile" && (
+          <>
+            <label style={{ fontWeight: 700 }}>Enter mobile number</label>
+            <Input type="tel" maxLength={10} placeholder="98765 43210" value={mobile} onChange={(e) => setMobile(e.target.value.replace(/\D/g, ""))} />
+            {error && <p style={{ color: C.danger, fontSize: 13 }}>{error}</p>}
+            <Btn onClick={sendOtp}>Send OTP</Btn>
+          </>
+        )}
+        {step === "otp" && (
+          <>
+            <Card style={{ background: C.softYellow, textAlign: "center" }}>
+              <strong>Demo Mode</strong> — no real SMS sent. Your OTP:
+              <div style={{ fontSize: 26, fontWeight: 800, letterSpacing: 4, marginTop: 4 }}>{demoOtp}</div>
+            </Card>
+            <label style={{ fontWeight: 700 }}>Enter OTP</label>
+            <Input maxLength={4} value={otp} onChange={(e) => setOtp(e.target.value.replace(/\D/g, ""))} />
+            <label style={{ fontWeight: 700 }}>Your name</label>
+            <Input value={name} onChange={(e) => setName(e.target.value)} />
+            {role !== "customer" && (
+              <>
+                <label style={{ fontWeight: 700 }}>UPI ID</label>
+                <Input placeholder="yourname@bank" value={upi} onChange={(e) => setUpi(e.target.value)} />
+              </>
+            )}
+            {error && <p style={{ color: C.danger, fontSize: 13 }}>{error}</p>}
+            <Btn onClick={verify}>Verify & Login</Btn>
+          </>
+        )}
+      </div>
+    </Shell>
+  );
+}
+
+// ---------------------------------------------------------------------
+// PROVIDER APP
+// ---------------------------------------------------------------------
+function ProviderApp({ user, listings, orders, shipments, setListings, setOrders, logout }) {
+  const [tab, setTab] = useState("home");
+  const myListings = listings.filter((l) => l.providerId === user.id);
+  const myOrders = orders.filter((o) => o.providerId === user.id);
+
+  return (
+    <Shell>
+      {tab === "home" && <ProviderHome user={user} myListings={myListings} onAdd={() => setTab("add")} onWaste={() => setTab("waste")} onLogout={logout} />}
+      {tab === "add" && <AddListingFlow user={user} listings={listings} setListings={setListings} onDone={() => setTab("home")} />}
+      {tab === "waste" && <AddListingFlow user={user} listings={listings} setListings={setListings} onDone={() => setTab("home")} wasteOnly />}
+      {tab === "orders" && <ProviderOrders orders={myOrders} shipments={shipments} onBack={() => setTab("home")} />}
+      <BottomNav
+        active={tab === "add" || tab === "waste" ? "home" : tab}
+        onChange={setTab}
+        items={[
+          { key: "home", icon: "🏠", label: "Home" },
+          { key: "orders", icon: "📦", label: "Orders" },
+          { key: "waste", icon: "🌿", label: "Waste" },
+        ]}
+      />
+    </Shell>
+  );
+}
+
+function ProviderHome({ user, myListings, onAdd, onWaste, onLogout }) {
+  const [prices] = useState(() => Object.entries(CATALOG).flatMap(([type, arr]) => arr.map((g) => ({ ...g, type }))));
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <div style={{ background: C.forest, color: "white", padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <div style={{ fontWeight: 700 }}>Namaste, {user.name} 🙏</div>
+          <div style={{ fontSize: 12, color: "#C8E6C9" }}>{user.mobile}</div>
+        </div>
+        <span style={{ cursor: "pointer" }} onClick={onLogout}>🚪</span>
+      </div>
+      <div style={{ padding: "16px 20px", overflowY: "auto", flex: 1 }}>
+        <h4 style={{ color: C.forest, margin: "0 0 8px" }}>📈 Market Prices (live)</h4>
+        <div style={{ display: "flex", gap: 10, overflowX: "auto", paddingBottom: 8 }}>
+          {prices.slice(0, 10).map((p, i) => (
+            <div key={i} style={{ minWidth: 100, flexShrink: 0, background: "white", borderRadius: 12, padding: 10, textAlign: "center", boxShadow: "0 2px 8px rgba(0,0,0,.06)" }}>
+              <div style={{ fontSize: 22 }}>{p.icon}</div>
+              <div style={{ fontSize: 11, fontWeight: 700 }}>{p.name}</div>
+              <div style={{ fontSize: 11, color: C.forest, fontWeight: 700 }}>₹{p.price}/{p.unit}</div>
+            </div>
+          ))}
+        </div>
+
+        <h4 style={{ color: C.forest, margin: "16px 0 8px" }}>🌾 My Listings</h4>
+        {myListings.length === 0 && (
+          <Card style={{ textAlign: "center", color: C.textMuted, padding: 24 }}>
+            You haven't listed anything yet. Tap + to sell your first crop.
+          </Card>
+        )}
+        {myListings.map((l) => (
+          <Card key={l.id} style={{ borderLeft: `4px solid ${C.leaf}` }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <div>
+                <strong>{l.icon} {l.name}</strong>
+                <div style={{ fontSize: 12, color: C.textMuted }}>{l.remaining}/{l.quantity} {l.unit} left</div>
+              </div>
+              <StatusPill status={l.remaining <= 0 ? "delivered" : "available"} />
+            </div>
+            <div style={{ marginTop: 6, fontSize: 13, fontWeight: 700, color: C.forest }}>₹{l.price}/{l.unit}</div>
+          </Card>
+        ))}
+      </div>
+      <button
+        onClick={onAdd}
+        style={{ position: "absolute", bottom: 76, right: 20, width: 56, height: 56, borderRadius: "50%", background: C.yellow, border: "none", fontSize: 28, boxShadow: "0 6px 16px rgba(249,168,37,.4)", cursor: "pointer" }}
+      >
+        +
+      </button>
+    </div>
+  );
+}
+
+function AddListingFlow({ user, listings, setListings, onDone, wasteOnly }) {
+  const [type, setType] = useState(wasteOnly ? "waste" : null);
+  const [good, setGood] = useState(null);
+  const [qty, setQty] = useState("");
+  const [photoTaken, setPhotoTaken] = useState(false);
+
+  async function submit() {
+    const newListing = {
+      id: uid(),
+      providerId: user.id,
+      providerName: user.name,
+      providerUpi: user.upi,
+      type,
+      name: good.name,
+      icon: good.icon,
+      price: good.price,
+      unit: good.unit,
+      quantity: Number(qty),
+      remaining: Number(qty),
+      location: randomPoint(),
+      createdAt: Date.now(),
+    };
+    const updated = [newListing, ...listings];
+    setListings(updated);
+    await saveList("listings", updated);
+    onDone();
+  }
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <Header title={wasteOnly ? "🌿 Sell Waste / Fodder" : "Add New Listing"} subtitle={wasteOnly ? "Fixed rate ₹5/kg" : undefined} onBack={onDone} />
+      <div style={{ padding: 20, overflowY: "auto", flex: 1, display: "flex", flexDirection: "column", gap: 16 }}>
+        {!wasteOnly && (
+          <div>
+            <label style={{ fontWeight: 700 }}>1. Take Photo</label>
+            <div
+              onClick={() => setPhotoTaken(true)}
+              style={{ marginTop: 8, height: 90, borderRadius: 12, background: photoTaken ? C.paleGreen : "#f2f2f2", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", border: `2px dashed ${C.leaf}` }}
+            >
+              {photoTaken ? "📸 Photo attached" : "Tap to simulate taking a photo"}
+            </div>
+          </div>
+        )}
+
+        {!wasteOnly && (
+          <div>
+            <label style={{ fontWeight: 700 }}>2. Select Type</label>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10, marginTop: 8 }}>
+              {Object.entries(TYPE_META).filter(([k]) => k !== "waste").map(([key, meta]) => (
+                <div
+                  key={key}
+                  onClick={() => { setType(key); setGood(null); }}
+                  style={{ background: type === key ? C.paleGreen : "white", border: `2px solid ${type === key ? C.leaf : C.paleGreen}`, borderRadius: 12, padding: "12px 6px", textAlign: "center", cursor: "pointer", fontSize: 12, fontWeight: 600 }}
+                >
+                  <div style={{ fontSize: 24 }}>{meta.icon}</div>
+                  {meta.label}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {type && (
+          <div>
+            <label style={{ fontWeight: 700 }}>{wasteOnly ? "Select Item" : "3. Select Name"}</label>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10, marginTop: 8 }}>
+              {CATALOG[type].map((g) => (
+                <div
+                  key={g.name}
+                  onClick={() => setGood(g)}
+                  style={{ background: good?.name === g.name ? C.paleGreen : "white", border: `2px solid ${good?.name === g.name ? C.leaf : C.paleGreen}`, borderRadius: 12, padding: "10px 4px", textAlign: "center", cursor: "pointer", fontSize: 11, fontWeight: 600 }}
+                >
+                  <div style={{ fontSize: 22 }}>{g.icon}</div>
+                  {g.name}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {good && (
+          <>
+            <Card style={{ background: C.paleGreen }}>
+              Market price for <strong>{good.name}</strong>: <strong>₹{good.price}/{good.unit}</strong>
+              <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }}>Auto-matched — you don't set your own price.</div>
+            </Card>
+            <label style={{ fontWeight: 700 }}>{wasteOnly ? "4." : "4."} Quantity ({good.unit})</label>
+            <Input type="number" value={qty} onChange={(e) => setQty(e.target.value)} placeholder="e.g. 20" />
+          </>
+        )}
+
+        <Btn disabled={!good || !qty} onClick={submit} variant={wasteOnly ? "accent" : "primary"}>
+          {wasteOnly ? `List for ₹${qty ? Number(qty) * 5 : 0}` : "List for Sale"}
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+function ProviderOrders({ orders, shipments, onBack }) {
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <Header title="📦 Incoming Orders" onBack={onBack} />
+      <div style={{ padding: 20, overflowY: "auto", flex: 1 }}>
+        {orders.length === 0 && <Card style={{ textAlign: "center", color: C.textMuted, padding: 24 }}>No orders yet.</Card>}
+        {orders.map((o) => {
+          const s = shipments.find((sh) => sh.orderId === o.id);
+          return (
+            <Card key={o.id}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <strong>{o.icon} {o.name}</strong>
+                <StatusPill status={o.status} />
+              </div>
+              <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>
+                {o.quantity} {o.unit} • ₹{o.total} • Buyer: {o.customerName}
+              </div>
+              {o.status !== "placed" && <div style={{ fontSize: 12, color: C.leaf, marginTop: 4 }}>✅ Payment received to your UPI</div>}
+              {s && <ShipmentMiniTrack shipment={s} />}
+            </Card>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// CUSTOMER APP
+// ---------------------------------------------------------------------
+function CustomerApp({ user, listings, orders, shipments, setListings, setOrders, logout }) {
+  const [tab, setTab] = useState("home");
+  const [selected, setSelected] = useState(null);
+  const myOrders = orders.filter((o) => o.customerId === user.id);
+
+  if (selected)
+    return (
+      <Shell>
+        <BuyFlow
+          user={user}
+          listing={selected}
+          listings={listings}
+          setListings={setListings}
+          orders={orders}
+          setOrders={setOrders}
+          onDone={() => setSelected(null)}
+        />
+      </Shell>
+    );
+
+  return (
+    <Shell>
+      {tab === "home" && <CustomerHome listings={listings.filter((l) => l.remaining > 0)} onSelect={setSelected} user={user} onLogout={logout} />}
+      {tab === "orders" && <CustomerOrders orders={myOrders} shipments={shipments} onBack={() => setTab("home")} />}
+      <BottomNav active={tab} onChange={setTab} items={[{ key: "home", icon: "🏠", label: "Home" }, { key: "orders", icon: "📦", label: "Orders" }]} />
+    </Shell>
+  );
+}
+
+function CustomerHome({ listings, onSelect, user, onLogout }) {
+  const [filter, setFilter] = useState("");
+  const filtered = filter ? listings.filter((l) => l.type === filter) : listings;
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <div style={{ background: C.forest, color: "white", padding: "16px 20px", display: "flex", justifyContent: "space-between" }}>
+        <div>
+          <div style={{ fontWeight: 700 }}>Namaste, {user.name} 🙏</div>
+        </div>
+        <span style={{ cursor: "pointer" }} onClick={onLogout}>🚪</span>
+      </div>
+      <div style={{ padding: "16px 20px", overflowY: "auto", flex: 1 }}>
+        <div style={{ display: "flex", gap: 8, overflowX: "auto", marginBottom: 12 }}>
+          {["", ...Object.keys(TYPE_META)].map((k) => (
+            <div
+              key={k || "all"}
+              onClick={() => setFilter(k)}
+              style={{ flexShrink: 0, padding: "8px 14px", borderRadius: 20, background: filter === k ? C.leaf : "white", color: filter === k ? "white" : C.textDark, fontSize: 12, fontWeight: 600, cursor: "pointer", border: `1px solid ${C.paleGreen}` }}
+            >
+              {k ? `${TYPE_META[k].icon} ${TYPE_META[k].label}` : "🛒 All"}
+            </div>
+          ))}
+        </div>
+        {filtered.length === 0 && <Card style={{ textAlign: "center", color: C.textMuted, padding: 24 }}>No listings available right now.</Card>}
+        {filtered.map((l) => (
+          <Card key={l.id} style={{ cursor: "pointer" }} onClick={() => onSelect(l)}>
+            <div style={{ display: "flex", gap: 12 }}>
+              <div style={{ width: 54, height: 54, borderRadius: 10, background: C.paleGreen, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 26 }}>{l.icon}</div>
+              <div style={{ flex: 1 }}>
+                <strong>{l.name}</strong>
+                <div style={{ fontSize: 12, color: C.textMuted }}>{l.providerName}</div>
+                <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
+                  <span style={{ background: C.paleGreen, color: C.forest, fontWeight: 700, fontSize: 12, padding: "3px 10px", borderRadius: 20 }}>₹{l.price}/{l.unit}</span>
+                  <span style={{ fontSize: 11, color: C.textMuted }}>{l.remaining} {l.unit} in stock</span>
+                </div>
+              </div>
+            </div>
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function BuyFlow({ user, listing, listings, setListings, orders, setOrders, onDone }) {
+  const [mode, setMode] = useState(null);
+  const [qty, setQty] = useState("");
+  const [step, setStep] = useState("select");
+
+  const total = qty ? Number(qty) * listing.price : 0;
+
+  async function confirmPayment() {
+    setStep("paying");
+    // simulate a short payment processing delay
+    setTimeout(async () => {
+      const updatedListings = listings.map((l) => (l.id === listing.id ? { ...l, remaining: l.remaining - Number(qty) } : l));
+      const newOrder = {
+        id: uid(),
+        listingId: listing.id,
+        providerId: listing.providerId,
+        providerUpi: listing.providerUpi,
+        customerId: user.id,
+        customerName: user.name,
+        name: listing.name,
+        icon: listing.icon,
+        quantity: Number(qty),
+        unit: listing.unit,
+        total,
+        status: "paid",
+        pickup: listing.location,
+        drop: randomPoint(),
+        createdAt: Date.now(),
+      };
+      const updatedOrders = [newOrder, ...orders];
+
+      // auto-create shipment for drivers, distance/time-based pay
+      const distanceKm = Number(haversine(newOrder.pickup, newOrder.drop).toFixed(1));
+      const minutes = Math.round((distanceKm / 35) * 60);
+      const newShipment = {
+        id: uid(),
+        orderId: newOrder.id,
+        driverId: null,
+        pickup: newOrder.pickup,
+        drop: newOrder.drop,
+        distanceKm,
+        minutes,
+        pay: driverPay(distanceKm, minutes),
+        status: "available",
+        goodName: listing.name,
+        goodIcon: listing.icon,
+        providerName: listing.providerName,
+        customerName: user.name,
+        progress: 0,
+      };
+
+      setListings(updatedListings);
+      setOrders(updatedOrders);
+      await saveList("listings", updatedListings);
+      await saveList("orders", updatedOrders);
+      const currentShipments = await loadList("shipments");
+      const newShipments = [newShipment, ...currentShipments];
+      await saveList("shipments", newShipments);
+
+      setStep("done");
+    }, 1200);
+  }
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <Header title={listing.name} subtitle={listing.providerName} onBack={onDone} />
+      <div style={{ padding: 20, overflowY: "auto", flex: 1, display: "flex", flexDirection: "column", gap: 14 }}>
+        <Card>
+          <div style={{ display: "flex", justifyContent: "space-between" }}>
+            <span style={{ background: C.paleGreen, color: C.forest, fontWeight: 700, fontSize: 13, padding: "3px 10px", borderRadius: 20 }}>₹{listing.price}/{listing.unit}</span>
+            <span>{listing.remaining} {listing.unit} in stock</span>
+          </div>
+        </Card>
+
+        {step === "select" && (
+          <>
+            <Btn onClick={() => { setMode("full"); setQty(String(listing.remaining)); setStep("confirm"); }}>
+              Buy Full Stock ({listing.remaining} {listing.unit})
+            </Btn>
+            <Btn variant="outline" onClick={() => { setMode("partial"); setStep("partial"); }}>
+              Buy Custom Quantity
+            </Btn>
+          </>
+        )}
+
+        {step === "partial" && (
+          <>
+            <label style={{ fontWeight: 700 }}>Quantity ({listing.unit})</label>
+            <Input type="number" max={listing.remaining} value={qty} onChange={(e) => setQty(e.target.value)} />
+            <Btn disabled={!qty || Number(qty) > listing.remaining || Number(qty) <= 0} onClick={() => setStep("confirm")}>
+              Continue
+            </Btn>
+          </>
+        )}
+
+        {step === "confirm" && (
+          <Card style={{ background: C.paleGreen }}>
+            <div>Quantity: <strong>{qty} {listing.unit}</strong></div>
+            <div>Total: <strong>₹{total}</strong></div>
+            <Btn style={{ marginTop: 12 }} onClick={() => setStep("pay-screen")}>Pay Now</Btn>
+          </Card>
+        )}
+
+        {step === "pay-screen" && (
+          <Card style={{ textAlign: "center", padding: 24 }}>
+            <div style={{ fontSize: 40 }}>📲</div>
+            <p style={{ fontWeight: 700 }}>Demo UPI Payment</p>
+            <p style={{ fontSize: 13, color: C.textMuted }}>Paying ₹{total} to {listing.providerName}'s UPI ({listing.providerUpi}). No real money moves in this demo.</p>
+            <Btn variant="accent" onClick={confirmPayment}>Simulate Payment Success</Btn>
+          </Card>
+        )}
+
+        {step === "paying" && (
+          <Card style={{ textAlign: "center", padding: 30 }}>
+            <div style={{ fontSize: 30 }}>⏳</div>
+            <p>Processing payment...</p>
+          </Card>
+        )}
+
+        {step === "done" && (
+          <Card style={{ textAlign: "center", padding: 24 }}>
+            <div style={{ fontSize: 44 }}>✅</div>
+            <p style={{ fontWeight: 700 }}>Order placed!</p>
+            <p style={{ fontSize: 13, color: C.textMuted }}>The farmer has been notified and a driver will pick this up soon.</p>
+            <Btn onClick={onDone}>Back to Marketplace</Btn>
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CustomerOrders({ orders, shipments, onBack }) {
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <Header title="📦 My Orders" onBack={onBack} />
+      <div style={{ padding: 20, overflowY: "auto", flex: 1 }}>
+        {orders.length === 0 && <Card style={{ textAlign: "center", color: C.textMuted, padding: 24 }}>No orders yet — go buy some fresh produce!</Card>}
+        {orders.map((o) => {
+          const s = shipments.find((sh) => sh.orderId === o.id);
+          return (
+            <Card key={o.id}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <strong>{o.icon} {o.name}</strong>
+                <StatusPill status={o.status} />
+              </div>
+              <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{o.quantity} {o.unit} • ₹{o.total}</div>
+              {s && <ShipmentMiniTrack shipment={s} />}
+            </Card>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// SHARED — mini live-tracking visual (simulated GPS)
+// ---------------------------------------------------------------------
+function ShipmentMiniTrack({ shipment }) {
+  if (shipment.status === "available") return <div style={{ fontSize: 12, color: C.textMuted, marginTop: 6 }}>Waiting for a driver to accept...</div>;
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 4 }}>
+        🚚 {shipment.status.replace("_", " ")} — {Math.round(shipment.progress * 100)}% of the way
+      </div>
+      <div style={{ height: 8, background: C.paleGreen, borderRadius: 6, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${shipment.progress * 100}%`, background: C.leaf, transition: "width .5s" }} />
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// DRIVER APP
+// ---------------------------------------------------------------------
+function DriverApp({ user, shipments, setShipments, logout }) {
+  const [tab, setTab] = useState("home");
+  const available = shipments.filter((s) => s.status === "available");
+  const mine = shipments.filter((s) => s.driverId === user.id);
+
+  // Simulate GPS movement for any shipment this driver has in progress
+  useEffect(() => {
+    const iv = setInterval(async () => {
+      const current = await loadList("shipments");
+      let changed = false;
+      const updated = current.map((s) => {
+        if (s.driverId === user.id && (s.status === "picked_up" || s.status === "in_transit") && s.progress < 1) {
+          changed = true;
+          return { ...s, progress: Math.min(1, s.progress + 0.05) };
+        }
+        return s;
+      });
+      if (changed) {
+        setShipments(updated);
+        await saveList("shipments", updated);
+      }
+    }, 800);
+    return () => clearInterval(iv);
+  }, [user.id, setShipments]);
+
+  async function accept(id) {
+    const current = await loadList("shipments");
+    const updated = current.map((s) => (s.id === id && s.status === "available" ? { ...s, status: "accepted", driverId: user.id, driverName: user.name } : s));
+    setShipments(updated);
+    await saveList("shipments", updated);
+    setTab("mine");
+  }
+
+  async function updateStatus(id, status) {
+    const current = await loadList("shipments");
+    const updated = current.map((s) => (s.id === id ? { ...s, status } : s));
+    setShipments(updated);
+    await saveList("shipments", updated);
+    if (status !== "delivered") {
+      const orders = await loadList("orders");
+      const shipment = updated.find((s) => s.id === id);
+      const updatedOrders = orders.map((o) => (o.id === shipment.orderId ? { ...o, status } : o));
+      await saveList("orders", updatedOrders);
+    }
+  }
+
+  async function scanDeliver(id) {
+    await updateStatus(id, "delivered");
+    const current = await loadList("shipments");
+    const shipment = current.find((s) => s.id === id);
+    const orders = await loadList("orders");
+    const updatedOrders = orders.map((o) => (o.id === shipment.orderId ? { ...o, status: "delivered" } : o));
+    await saveList("orders", updatedOrders);
+  }
+
+  return (
+    <Shell>
+      {tab === "home" && <DriverHome user={user} available={available} onAccept={accept} onLogout={logout} />}
+      {tab === "mine" && <DriverShipments shipments={mine} onUpdate={updateStatus} onScan={scanDeliver} onBack={() => setTab("home")} />}
+      <BottomNav active={tab} onChange={setTab} items={[{ key: "home", icon: "🏠", label: "Available" }, { key: "mine", icon: "🚚", label: "My Trips" }]} />
+    </Shell>
+  );
+}
+
+function DriverHome({ user, available, onAccept, onLogout }) {
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <div style={{ background: C.forest, color: "white", padding: "16px 20px", display: "flex", justifyContent: "space-between" }}>
+        <div style={{ fontWeight: 700 }}>Namaste, {user.name} 🙏</div>
+        <span style={{ cursor: "pointer" }} onClick={onLogout}>🚪</span>
+      </div>
+      <div style={{ padding: "16px 20px", overflowY: "auto", flex: 1 }}>
+        <h4 style={{ color: C.forest, margin: "0 0 8px" }}>🚚 Available Shipments</h4>
+        {available.length === 0 && <Card style={{ textAlign: "center", color: C.textMuted, padding: 24 }}>No shipments available right now.</Card>}
+        {available.map((s) => (
+          <Card key={s.id}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <div>
+                <strong>{s.goodIcon} {s.goodName}</strong>
+                <div style={{ fontSize: 12, color: C.textMuted }}>From: {s.providerName}</div>
+              </div>
+              <span style={{ background: C.paleGreen, color: C.forest, fontWeight: 700, fontSize: 13, padding: "3px 10px", borderRadius: 20 }}>₹{s.pay}</span>
+            </div>
+            <div style={{ display: "flex", gap: 16, fontSize: 12, color: C.textMuted, marginTop: 8 }}>
+              <span>📏 {s.distanceKm} km</span>
+              <span>⏱ ~{s.minutes} min</span>
+            </div>
+            <Btn style={{ marginTop: 10, padding: 10 }} onClick={() => onAccept(s.id)}>Accept</Btn>
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DriverShipments({ shipments, onUpdate, onScan, onBack }) {
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <Header title="🚚 My Trips" onBack={onBack} />
+      <div style={{ padding: 20, overflowY: "auto", flex: 1 }}>
+        {shipments.length === 0 && <Card style={{ textAlign: "center", color: C.textMuted, padding: 24 }}>You haven't accepted any shipments yet.</Card>}
+        {shipments.map((s) => (
+          <Card key={s.id}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <strong>{s.goodIcon} {s.goodName}</strong>
+              <StatusPill status={s.status} />
+            </div>
+            <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{s.providerName} → {s.customerName} • ₹{s.pay}</div>
+            <ShipmentMiniTrack shipment={s} />
+            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+              {s.status === "accepted" && <Btn variant="outline" style={{ padding: 10 }} onClick={() => onUpdate(s.id, "picked_up")}>Mark Picked Up</Btn>}
+              {s.status === "picked_up" && <Btn variant="outline" style={{ padding: 10 }} onClick={() => onUpdate(s.id, "in_transit")}>Start Transit</Btn>}
+              {(s.status === "picked_up" || s.status === "in_transit") && (
+                <Btn style={{ padding: 10 }} onClick={() => onScan(s.id)}>Scan to Deliver</Btn>
+              )}
+            </div>
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+}
